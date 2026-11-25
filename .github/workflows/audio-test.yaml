@@ -16,7 +16,7 @@ env:
   PLUGIN_NAME: loop-track-switcher
   OBS_VERSION: 31.1.1
   # Keep this list equal to AUDIO_TEST_SCENARIOS in CMakeLists.txt
-  SCENARIOS: scaffold-tone
+  SCENARIOS: playback loop invalid-loop
 jobs:
   windows-audio:
     name: Audio test on Windows
@@ -77,10 +77,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y xvfb xauth libx11-dev
 
-      - name: Build audio test
+      - name: Build audio test and engine test
         run: |
           cmake -S . -B build_x86_64 -DENABLE_AUDIO_TESTS=ON
-          cmake --build build_x86_64 --config RelWithDebInfo --target audio-test
+          cmake --build build_x86_64 --config RelWithDebInfo --target audio-test engine-test
+
+      - name: Run engine unit test
+        run: ctest --test-dir build_x86_64 -C RelWithDebInfo -R '^engine$' -V --no-tests=error
 
       - name: Run audio scenario test
         run: |
