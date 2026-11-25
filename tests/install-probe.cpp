@@ -816,12 +816,68 @@ void restore_steps()
 	});
 }
 
+// --- CPU phase: compares the CPU use of OBS with no source, five media sources, and five loop track sources ---
+
+void cpu_steps()
+{
+	auto measure = [](const char *key) {
+		QJsonArray values;
+		for (int i = 0; i < 3; i++)
+			values.append(cpu_percent(5000));
+		evidence.insert(key, values);
+	};
+	steps.push_back([measure] {
+		measure("cpu_no_source");
+		for (int i = 1; i <= 5; i++) {
+			obs_data_t *settings = obs_data_create();
+			obs_data_set_string(settings, "local_file", song("aligned/1-pad.wav").toUtf8().constData());
+			obs_data_set_bool(settings, "looping", true);
+			obs_source_t *media = obs_source_create(
+				"ffmpeg_source", QString("Media %1").arg(i).toUtf8().constData(), settings, nullptr);
+			obs_data_release(settings);
+			obs_source_t *scene_source = obs_frontend_get_current_scene();
+			obs_scene_add(obs_scene_from_source(scene_source), media);
+			obs_source_release(scene_source);
+			obs_source_release(media);
+		}
+		return 2000;
+	});
+	steps.push_back([measure] {
+		measure("cpu_five_media_sources_playing");
+		for (int i = 1; i <= 5; i++)
+			remove_source(QString("Media %1").arg(i).toUtf8().constData());
+		for (int i = 1; i <= 5; i++) {
+			obs_source_t *s =
+				create_in_scene(QString("Loop %1").arg(i).toUtf8().constData(), stems("aligned"));
+			obs_source_release(s);
+		}
+		return 3000;
+	});
+	steps.push_back([measure] {
+		measure("cpu_five_loop_sources_stopped");
+		for (int i = 1; i <= 5; i++) {
+			obs_source_t *source = obs_get_source_by_name(QString("Loop %1").arg(i).toUtf8().constData());
+			calldata_t cd = {};
+			proc_handler_call(obs_source_get_proc_handler(source), "play", &cd);
+			calldata_free(&cd);
+			obs_source_release(source);
+		}
+		return 1000;
+	});
+	steps.push_back([measure] {
+		measure("cpu_five_loop_sources_playing");
+		return 0;
+	});
+}
+
 void on_frontend_event(enum obs_frontend_event event, void *)
 {
 	if (event != OBS_FRONTEND_EVENT_FINISHED_LOADING)
 		return;
 	if (phase == "setup")
 		setup_steps();
+	else if (phase == "cpu")
+		cpu_steps();
 	else
 		restore_steps();
 	// Let the plugin add its dock first, which it also does on FINISHED_LOADING
