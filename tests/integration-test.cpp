@@ -9,6 +9,10 @@
 //   playback      Play, track switches, Pause, and Stop change the output as expected.
 //   loop          Playback loops inside the loop range without gaps.
 //   invalid-loop  A loop end beyond the tracks is reported, and Play stays silent.
+//   outro         With the loop off, playback goes into the outro and stops at the song end. A seek into the
+//                 outro also plays to the end and stops.
+//   bake          Tracks at 44.1 kHz are baked into the module config folder. A new source with the same files
+//                 reads the bakes. Removing the source by the user deletes them.
 // Exit codes: 0 on pass, 1 on a failed check, 2 when the test cannot start.
 
 #include <obs.h>
@@ -119,13 +123,13 @@ double tone_amplitude(const std::vector<float> &samples, double frequency)
 	return 2.0 * std::sqrt(std::max(power, 0.0)) / double(samples.size());
 }
 
-void write_tone_wav(const std::filesystem::path &path, double frequency)
+void write_tone_wav(const std::filesystem::path &path, double frequency, uint32_t rate)
 {
-	const uint32_t frames = static_cast<uint32_t>(kTrackSeconds * kSampleRate);
+	const uint32_t frames = static_cast<uint32_t>(kTrackSeconds * rate);
 	std::vector<int16_t> data(frames * 2);
 	for (uint32_t i = 0; i < frames; i++) {
 		const auto v = static_cast<int16_t>(
-			std::lround(kAmplitude * 32767.0 * std::sin(2.0 * kPi * frequency * i / kSampleRate)));
+			std::lround(kAmplitude * 32767.0 * std::sin(2.0 * kPi * frequency * i / rate)));
 		data[i * 2] = v;
 		data[i * 2 + 1] = v;
 	}
@@ -145,8 +149,8 @@ void write_tone_wav(const std::filesystem::path &path, double frequency)
 	u32(f, 16);
 	u16(f, 1);
 	u16(f, 2);
-	u32(f, kSampleRate);
-	u32(f, kSampleRate * 4);
+	u32(f, rate);
+	u32(f, rate * 4);
 	u16(f, 4);
 	u16(f, 16);
 	f.write("data", 4);
@@ -167,7 +171,7 @@ State get_state(obs_source_t *source)
 	proc_handler_call(obs_source_get_proc_handler(source), "get_state", &cd);
 	State state;
 	state.transport = calldata_int(&cd, "transport");
-	state.position = calldata_float(&cd, "position");
+	state.position = static_cast<double>(calldata_int(&cd, "position")) / kSampleRate;
 	state.loop_status = calldata_int(&cd, "loop_status");
 	for (int t = 0; t < 4; t++)
 		if (calldata_int(&cd, ("state" + std::to_string(t)).c_str()) == 2)
@@ -189,6 +193,31 @@ void set_track(obs_source_t *source, int track, bool enabled)
 	calldata_set_int(&cd, "track", track);
 	calldata_set_bool(&cd, "enabled", enabled);
 	proc_handler_call(obs_source_get_proc_handler(source), "set_track", &cd);
+	calldata_free(&cd);
+}
+
+void set_loop_range(obs_source_t *source, double start_seconds, double end_seconds)
+{
+	calldata_t cd = {};
+	calldata_set_int(&cd, "start", std::llround(start_seconds * kSampleRate));
+	calldata_set_int(&cd, "end", std::llround(end_seconds * kSampleRate));
+	proc_handler_call(obs_source_get_proc_handler(source), "set_loop_range", &cd);
+	calldata_free(&cd);
+}
+
+void call_bool(obs_source_t *source, const char *procedure, bool value)
+{
+	calldata_t cd = {};
+	calldata_set_bool(&cd, "enabled", value);
+	proc_handler_call(obs_source_get_proc_handler(source), procedure, &cd);
+	calldata_free(&cd);
+}
+
+void seek(obs_source_t *source, double seconds)
+{
+	calldata_t cd = {};
+	calldata_set_int(&cd, "frames", std::llround(seconds * kSampleRate));
+	proc_handler_call(obs_source_get_proc_handler(source), "seek", &cd);
 	calldata_free(&cd);
 }
 
@@ -301,10 +330,7 @@ void scenario_loop(obs_source_t *source, Capture &capture)
 
 void scenario_invalid_loop(obs_source_t *source, Capture &capture)
 {
-	obs_data_t *settings = obs_data_create();
-	obs_data_set_double(settings, "loop_end", 3.0);
-	obs_source_update(source, settings);
-	obs_data_release(settings);
+	set_loop_range(source, 0.0, 3.0);
 	check(get_state(source).loop_status == 3, "a loop end beyond the 2 s tracks is reported");
 
 	call(source, "play");
@@ -314,14 +340,64 @@ void scenario_invalid_loop(obs_source_t *source, Capture &capture)
 		check_silent(samples, "play with an invalid loop");
 	check(get_state(source).transport == 0, "transport stays Stopped");
 
-	settings = obs_data_create();
-	obs_data_set_double(settings, "loop_end", 0.0);
-	obs_source_update(source, settings);
-	obs_data_release(settings);
+	set_loop_range(source, 0.0, 0.0);
 	check(get_state(source).loop_status == 0, "loop end 0 makes the loop valid again");
 }
 
-bool start_obs()
+void scenario_outro(obs_source_t *source, Capture &capture)
+{
+	// The loop is 0.5 s to 1.5 s and the song ends at 2 s
+	call_bool(source, "set_loop", false);
+	call(source, "play");
+	sleep_ms(2400);
+	State state = get_state(source);
+	check(state.transport == 0 && state.position == 0.0, "with the loop off, playback stops at the song end");
+	std::vector<float> samples;
+	if (collect(capture, kMeasureFrames, samples))
+		check_silent(samples, "after the song end");
+
+	call_bool(source, "set_loop", true);
+	call(source, "play");
+	settle();
+	seek(source, 1.7);
+	sleep_ms(600);
+	state = get_state(source);
+	check(state.transport == 0, "a seek into the outro plays to the song end and stops, even with the loop on");
+}
+
+void scenario_bake(obs_source_t *source, Capture &, const std::filesystem::path &config_dir, obs_data_t *settings)
+{
+	namespace fs = std::filesystem;
+	const fs::path bakes = config_dir / "loop-track-switcher" / "bakes";
+	auto count_bakes = [&bakes] {
+		size_t count = 0;
+		std::error_code ec;
+		for (fs::directory_iterator it(bakes, ec), end; !ec && it != end; it.increment(ec))
+			if (it->path().extension() == ".ltsbake")
+				count++;
+		return count;
+	};
+	check(count_bakes() == 4, "four tracks at 44.1 kHz are baked (" + std::to_string(count_bakes()) + ")");
+
+	// Releasing without removal (as at exit) keeps the bakes. A new source loads the same files again.
+	obs_source_release(source);
+	obs_source_t *again = obs_source_create(kSourceId, "loop track test again", settings, nullptr);
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+	while (get_state(again).ready_count < 4 && std::chrono::steady_clock::now() < deadline)
+		sleep_ms(20);
+	check(get_state(again).ready_count == 4, "a new source loads the same files");
+	check(count_bakes() == 4, "the bakes are kept when a source is released without removal");
+
+	// Removing the source by the user deletes its bakes
+	obs_source_remove(again);
+	obs_source_release(again);
+	const auto removed_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+	while (count_bakes() > 0 && std::chrono::steady_clock::now() < removed_deadline)
+		sleep_ms(20);
+	check(count_bakes() == 0, "removing the source by the user deletes its bakes");
+}
+
+bool start_obs(const std::filesystem::path &config_dir)
 {
 #if defined(__linux__)
 	// libobs on Linux expects a display for its hotkey handling. In CI, the display comes from xvfb-run.
@@ -333,7 +409,9 @@ bool start_obs()
 	obs_set_nix_platform(OBS_NIX_PLATFORM_X11_EGL);
 	obs_set_nix_platform_display(display);
 #endif
-	if (!obs_startup("en-US", nullptr, nullptr)) {
+	// The module config folder holds the bakes. A temporary folder keeps the test independent of the user's OBS.
+	const std::string config = config_dir.u8string() + "/";
+	if (!obs_startup("en-US", config.c_str(), nullptr)) {
 		std::fprintf(stderr, "failed to start OBS\n");
 		return false;
 	}
@@ -358,24 +436,24 @@ bool load_plugin(const char *plugin_path, const char *module_data)
 	return true;
 }
 
-int run_scenario(const std::string &scenario)
+int run_scenario(const std::string &scenario, const std::filesystem::path &config_dir)
 {
 	const auto dir = std::filesystem::temp_directory_path() / ("lts-integration-" + scenario);
 	std::filesystem::create_directories(dir);
+	// The bake scenario uses 44.1 kHz files, which are resampled and baked. The others use 48 kHz WAV.
+	const uint32_t rate = scenario == "bake" ? 44100 : kSampleRate;
 	obs_data_t *settings = obs_data_create();
 	for (int t = 0; t < 4; t++) {
 		const auto path = dir / ("track" + std::to_string(t + 1) + ".wav");
-		write_tone_wav(path, kFrequencies[t]);
+		write_tone_wav(path, kFrequencies[t], rate);
 		obs_data_set_string(settings, ("track" + std::to_string(t + 1) + "_path").c_str(),
 				    path.u8string().c_str());
 	}
-	obs_data_set_double(settings, "loop_start", 0.5);
-	obs_data_set_double(settings, "loop_end", 1.5);
 
 	// Creating the source by id is what OBS does when the user picks it from the source list
 	obs_source_t *source = obs_source_create(kSourceId, "loop track test", settings, nullptr);
-	obs_data_release(settings);
 	if (!source) {
+		obs_data_release(settings);
 		std::fprintf(stderr, "failed to create source %s\n", kSourceId);
 		return 2;
 	}
@@ -385,6 +463,7 @@ int run_scenario(const std::string &scenario)
 	while (get_state(source).ready_count < 4 && std::chrono::steady_clock::now() < deadline)
 		sleep_ms(20);
 	check(get_state(source).ready_count == 4, "all four tracks are loaded");
+	set_loop_range(source, 0.5, 1.5);
 	check(get_state(source).loop_status == 0, "the loop range is valid");
 
 	Capture capture;
@@ -397,13 +476,23 @@ int run_scenario(const std::string &scenario)
 		scenario_loop(source, capture);
 	else if (scenario == "invalid-loop")
 		scenario_invalid_loop(source, capture);
-	else {
+	else if (scenario == "outro")
+		scenario_outro(source, capture);
+	else if (scenario == "bake") {
+		obs_source_remove_audio_capture_callback(source, capture_audio, &capture);
+		// The scenario releases the source itself
+		scenario_bake(source, capture, config_dir, settings);
+		source = nullptr;
+	} else {
 		std::fprintf(stderr, "unknown scenario %s\n", scenario.c_str());
 		result = 2;
 	}
 
-	obs_source_remove_audio_capture_callback(source, capture_audio, &capture);
-	obs_source_release(source);
+	if (source) {
+		obs_source_remove_audio_capture_callback(source, capture_audio, &capture);
+		obs_source_release(source);
+	}
+	obs_data_release(settings);
 	std::error_code ignored;
 	std::filesystem::remove_all(dir, ignored);
 	if (result != 0)
@@ -419,14 +508,20 @@ int main(int argc, char **argv)
 		std::fprintf(stderr, "usage: audio-test <plugin module> <plugin data folder> <scenario>\n");
 		return 2;
 	}
-	if (!start_obs())
+	const auto config_dir =
+		std::filesystem::temp_directory_path() / ("lts-integration-config-" + std::string(argv[3]));
+	std::error_code ignored;
+	std::filesystem::remove_all(config_dir, ignored);
+	std::filesystem::create_directories(config_dir);
+	if (!start_obs(config_dir))
 		return 2;
 	if (!load_plugin(argv[1], argv[2])) {
 		obs_shutdown();
 		return 2;
 	}
-	const int result = run_scenario(argv[3]);
+	const int result = run_scenario(argv[3], config_dir);
 	obs_shutdown();
+	std::filesystem::remove_all(config_dir, ignored);
 	std::printf("%s %s\n", result == 0 ? "PASS" : "FAIL", argv[3]);
 	return result;
 }

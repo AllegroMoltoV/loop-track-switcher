@@ -16,7 +16,7 @@ env:
   PLUGIN_NAME: loop-track-switcher
   OBS_VERSION: 31.1.1
   # Keep this list equal to AUDIO_TEST_SCENARIOS in CMakeLists.txt
-  SCENARIOS: playback loop invalid-loop
+  SCENARIOS: playback loop invalid-loop outro bake
 jobs:
   windows-audio:
     name: Audio test on Windows

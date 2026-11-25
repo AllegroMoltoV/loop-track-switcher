@@ -35,18 +35,19 @@ if(ENABLE_QT)
   )
 endif()
 
-# The track engine and the WAV loader do not depend on OBS or Qt, so that the unit test can link them alone.
+# The track engine and the audio loader do not depend on OBS or Qt, so that the unit test can link them alone.
 # The library is linked into the plugin module, which needs position independent code on Linux.
 add_library(
   lts-engine
   STATIC
   src/engine/track-engine.cpp
   src/engine/track-engine.hpp
-  src/engine/wav-loader.cpp
-  src/engine/wav-loader.hpp
-  src/engine/dr-wav-impl.c
+  src/engine/track-loader.cpp
+  src/engine/track-loader.hpp
+  src/engine/decoder-impl.c
+  src/third-party/stb_vorbis.c
 )
-target_include_directories(lts-engine PUBLIC src/engine PRIVATE src/third-party)
+target_include_directories(lts-engine PUBLIC src/engine PRIVATE src/third-party src/third-party/r8brain)
 target_compile_features(lts-engine PUBLIC cxx_std_17)
 set_target_properties(lts-engine PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -75,12 +76,19 @@ enable_testing()
 # Unit test of the track engine and the WAV loader (tests/engine-test.cpp). Needs neither OBS nor Qt.
 add_executable(engine-test tests/engine-test.cpp)
 target_link_libraries(engine-test PRIVATE lts-engine)
-add_test(NAME engine COMMAND engine-test)
+add_test(NAME engine COMMAND engine-test "${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
 
 # Scenario test that loads the plugin into libobs and checks the audio it outputs (tests/integration-test.cpp).
 # The test is always built on Windows. On Linux, the CI workflow (audio-test.yaml) turns it on.
 option(ENABLE_AUDIO_TESTS "Build the audio scenario test on Linux" OFF)
-set(AUDIO_TEST_SCENARIOS playback loop invalid-loop)
+set(
+  AUDIO_TEST_SCENARIOS
+  playback
+  loop
+  invalid-loop
+  outro
+  bake
+)
 if(WIN32 OR ENABLE_AUDIO_TESTS)
   add_executable(audio-test tests/integration-test.cpp)
   target_compile_features(audio-test PRIVATE cxx_std_17)
@@ -108,4 +116,18 @@ if(WIN32)
           "PATH=path_list_prepend:${CMAKE_CURRENT_SOURCE_DIR}/.deps/bin/64bit;PATH=path_list_prepend:${CMAKE_CURRENT_SOURCE_DIR}/.deps/obs-deps-${AUDIO_TEST_DEPS_VERSION}-x64/bin;PATH=path_list_prepend:${CMAKE_CURRENT_SOURCE_DIR}/.deps/obs-deps-qt6-${AUDIO_TEST_DEPS_VERSION}-x64/bin"
     )
   endforeach()
+endif()
+
+# Module that checks the installed plugin inside a portable OBS Studio (tests/install-probe.cpp).
+# It is used only for local verification and is not part of the release.
+option(ENABLE_INSTALL_PROBE "Build the module that checks the installed plugin inside OBS Studio" OFF)
+if(WIN32 AND ENABLE_INSTALL_PROBE)
+  add_library(lts-install-probe MODULE tests/install-probe.cpp)
+  target_link_libraries(lts-install-probe PRIVATE OBS::libobs OBS::obs-frontend-api Qt6::Widgets)
+  set_target_properties(
+    lts-install-probe
+    PROPERTIES
+      LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/install-probe"
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/install-probe"
+  )
 endif()
