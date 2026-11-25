@@ -85,6 +85,12 @@ jobs:
       - name: Run engine unit test
         run: ctest --test-dir build_x86_64 -C RelWithDebInfo -R '^engine$' -V --no-tests=error
 
+      - name: Run engine unit test with sanitizers
+        run: |
+          cmake -S . -B build_sanitize -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLTS_SANITIZE=ON
+          cmake --build build_sanitize --config RelWithDebInfo --target engine-test
+          ctest --test-dir build_sanitize -C RelWithDebInfo -R '^engine$' -V --no-tests=error
+
       - name: Run audio scenario test
         run: |
           plugin=$(find "$PWD/build_x86_64" -name "${PLUGIN_NAME}.so" -print -quit)
