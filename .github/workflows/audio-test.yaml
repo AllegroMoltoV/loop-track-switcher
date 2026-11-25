@@ -1,0 +1,108 @@
+name: Audio scenario test
+# Loads the plugin into libobs on Windows and Ubuntu, creates the loop track source, and checks the audio it outputs.
+# No graphics are needed. On Ubuntu, xvfb-run provides the X display that libobs expects for hotkeys.
+# audio-test exits with 0 on pass, 1 on a failed check, and 2 when it cannot start.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+permissions:
+  contents: read
+env:
+  PLUGIN_NAME: loop-track-switcher
+  OBS_VERSION: 31.1.1
+  # Keep this list equal to AUDIO_TEST_SCENARIOS in CMakeLists.txt
+  SCENARIOS: scaffold-tone
+jobs:
+  windows-audio:
+    name: Audio test on Windows
+    runs-on: windows-2022
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Build plugin and audio test
+        uses: ./.github/actions/build-plugin
+        with:
+          target: x64
+          config: RelWithDebInfo
+
+      - name: Run audio scenario test
+        run: |
+          ctest --test-dir build_x64 -C RelWithDebInfo -V --no-tests=error 2>&1 | Tee-Object -FilePath audio-windows.log
+          exit $LASTEXITCODE
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: audio-windows
+          path: audio-windows.log
+          if-no-files-found: warn
+
+  ubuntu-audio:
+    name: Audio test on Ubuntu
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      # The official OBS PPA intermittently returns 503, so let apt retry failed downloads
+      - name: Retry apt downloads
+        run: echo 'Acquire::Retries "10";' | sudo tee /etc/apt/apt.conf.d/80-retries
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Build plugin
+        uses: ./.github/actions/build-plugin
+        with:
+          target: x86_64
+          config: RelWithDebInfo
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xauth libx11-dev
+
+      - name: Build audio test
+        run: |
+          cmake -S . -B build_x86_64 -DENABLE_AUDIO_TESTS=ON
+          cmake --build build_x86_64 --config RelWithDebInfo --target audio-test
+
+      - name: Run audio scenario test
+        run: |
+          plugin=$(find "$PWD/build_x86_64" -name "${PLUGIN_NAME}.so" -print -quit)
+          test=$(find "$PWD/build_x86_64" -name 'audio-test' -type f -print -quit)
+          echo "plugin=${plugin} test=${test}"
+          failed=0
+          for scenario in ${SCENARIOS}; do
+            if xvfb-run -a "${test}" "${plugin}" "$PWD/data" "${scenario}" >> audio-ubuntu.log 2>&1; then
+              echo "PASS ${scenario}" | tee -a audio-ubuntu.log
+            else
+              echo "FAIL ${scenario}" | tee -a audio-ubuntu.log
+              failed=1
+            fi
+          done
+          cat audio-ubuntu.log
+          exit ${failed}
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: audio-ubuntu
+          path: audio-ubuntu.log
+          if-no-files-found: warn
