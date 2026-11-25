@@ -187,6 +187,8 @@ void loader_thread(LoopTrackSource *lt)
 				obs_log(LOG_WARNING, "failed to load track %d (error %d)", track + 1,
 					static_cast<int>(result.error));
 			}
+			if (!result.detail.empty())
+				obs_log(LOG_WARNING, "track %d: %s", track + 1, result.detail.c_str());
 		}
 
 		// The previous data is released here, outside the engine lock

@@ -53,6 +53,10 @@ struct LoadResult {
 	LoadInfo info;
 	// The bake file used or written, empty when the file needed no bake
 	std::string bake_path;
+	// What went wrong, for the log. Empty when nothing did. A loaded track can have a detail when its bake failed.
+	std::string detail;
+	// Set when a failure came from the bake, so that loading without a bake may still work
+	bool retry_without_bake = false;
 };
 
 // Reads a WAV, FLAC, MP3, or Ogg Vorbis file into 16-bit stereo at 48 kHz. The path is UTF-8.

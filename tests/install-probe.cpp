@@ -545,6 +545,9 @@ void setup_steps()
 		      "misaligned: [!] appears next to the tracks shorter than the song");
 		auto *label = dock_child<QLabel>("track_warning_3");
 		evidence.insert("misaligned_tooltip", label ? label->toolTip() : QString());
+		// A picture of the dock with warnings, for the author to look at
+		if (auto *d = dock())
+			d->grab().save(result_dir + "/dock-misaligned.png");
 		check(label && label->toolTip().contains("0:14.0") && label->toolTip().contains("0:18.0"),
 		      "misaligned: the tooltip gives the track end and the song end");
 		click("play_button");
