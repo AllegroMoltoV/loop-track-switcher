@@ -18,16 +18,31 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #pragma once
 
-#include <obs-module.h>
+#include "track-engine.hpp"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+#include <memory>
+#include <string>
 
-#define LOOP_TRACK_SOURCE_ID "loop_track_switcher_source"
+namespace lts {
 
-extern struct obs_source_info loop_track_source_info;
+enum class WavError : int {
+	None = 0,
+	OpenFailed = 1,
+	NotStereo = 2,
+	Not48k = 3,
+	UnsupportedFormat = 4,
+	ReadFailed = 5,
+	OutOfMemory = 6,
+};
 
-#ifdef __cplusplus
-}
-#endif
+struct WavLoadResult {
+	std::unique_ptr<TrackData> data;
+	WavError error = WavError::None;
+};
+
+// Reads a whole WAV file into 16-bit stereo. Accepts 48 kHz stereo integer PCM (16, 24, or 32 bits) and 32-bit
+// float. Wider samples are converted to 16 bits while reading, without a float copy of the whole file.
+// The path is UTF-8.
+WavLoadResult load_wav(const std::string &path);
+
+} // namespace lts
