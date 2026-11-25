@@ -64,19 +64,35 @@ target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE lts-engine)
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
 
-# Stack protection for the plugin. MSVC enables /GS by default; it is stated here to make the setting explicit.
-if(MSVC)
-  target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE /GS)
-else()
-  target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE -fstack-protector-strong)
-endif()
+# Stack protection for the plugin and the engine with the decoders. MSVC enables /GS by default; it is stated here to make the setting explicit.
+foreach(_target IN ITEMS ${CMAKE_PROJECT_NAME} lts-engine)
+  if(MSVC)
+    target_compile_options(${_target} PRIVATE /GS)
+  else()
+    target_compile_options(${_target} PRIVATE -fstack-protector-strong)
+  endif()
+endforeach()
 
 enable_testing()
 
-# Unit test of the track engine and the WAV loader (tests/engine-test.cpp). Needs neither OBS nor Qt.
+# Unit test of the track engine and the audio loader (tests/engine-test.cpp). Needs neither OBS nor Qt.
 add_executable(engine-test tests/engine-test.cpp)
 target_link_libraries(engine-test PRIVATE lts-engine)
 add_test(NAME engine COMMAND engine-test "${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
+
+# The sanitizers instrument the engine, which the plugin module links as well.
+# With this option on, build only the engine-test target; libobs does not load the sanitizer runtimes.
+option(
+  LTS_SANITIZE
+  "Build the engine unit test with AddressSanitizer and UndefinedBehaviorSanitizer (GCC and Clang only)"
+  OFF
+)
+if(LTS_SANITIZE AND NOT MSVC)
+  set(_sanitize_flags -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer)
+  target_compile_options(lts-engine PRIVATE ${_sanitize_flags})
+  target_compile_options(engine-test PRIVATE ${_sanitize_flags})
+  target_link_options(engine-test PRIVATE -fsanitize=address,undefined)
+endif()
 
 # Scenario test that loads the plugin into libobs and checks the audio it outputs (tests/integration-test.cpp).
 # The test is always built on Windows. On Linux, the CI workflow (audio-test.yaml) turns it on.
