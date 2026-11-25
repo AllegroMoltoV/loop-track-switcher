@@ -19,7 +19,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "loop-track-source.hpp"
 
 #include "track-engine.hpp"
-#include "wav-loader.hpp"
+#include "track-loader.hpp"
 
 #include <plugin-support.h>
 #include <util/platform.h>
@@ -28,21 +28,30 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include <array>
 #include <atomic>
-#include <cmath>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
+
+std::atomic<bool> bulk_teardown{false};
 
 namespace {
 
 // Each chunk is 10 ms. The chunk for [t, t + 10 ms) is sent at time t, the same way as simple-white-noise.
 constexpr size_t kChunkFrames = 480;
 
-constexpr const char *kLoopStart = "loop_start";
-constexpr const char *kLoopEnd = "loop_end";
+// Settings keys. The track paths are shown in the properties. The others are written by save and read by create,
+// because the properties dialog restores all settings when it is cancelled, which would undo changes made in the
+// dock meanwhile.
+constexpr const char *kLoopStart = "loop_start_frames";
+constexpr const char *kLoopEnd = "loop_end_frames";
+constexpr const char *kLoopEnabled = "loop_enabled";
+constexpr const char *kCrossfade = "crossfade_enabled";
+
+std::string bake_folder;
 
 std::string track_key(int track, const char *suffix)
 {
@@ -55,17 +64,14 @@ std::string base_name(const std::string &path)
 	return slash == std::string::npos ? path : path.substr(slash + 1);
 }
 
-uint64_t seconds_to_frames(double seconds)
-{
-	if (!(seconds > 0.0))
-		return 0;
-	return static_cast<uint64_t>(std::llround(seconds * lts::kSampleRate));
-}
-
 struct TrackStatus {
 	TrackState state = TRACK_EMPTY;
-	lts::WavError error = lts::WavError::None;
+	lts::LoadError error = lts::LoadError::None;
 	std::string name;
+	lts::LoadInfo info;
+	uint64_t frames = 0;
+	std::string bake_path;
+	std::shared_ptr<const lts::TrackData> data;
 };
 
 struct LoopTrackSource {
@@ -75,19 +81,23 @@ struct LoopTrackSource {
 	std::thread generator;
 	std::atomic<bool> stop_generator{false};
 
-	// Loading runs on its own thread so that the settings dialog and the audio never wait for the disk.
-	// pending holds the latest requested path of each track.
+	// Loading runs on its own thread, one track at a time, so that the settings dialog and the audio never wait
+	// for decoding. pending holds the latest requested path of each track.
 	std::thread loader;
 	std::mutex job_mutex;
 	std::condition_variable job_cv;
 	std::array<std::optional<std::string>, lts::kTrackCount> pending;
 	bool quit_loader = false;
+	std::atomic<bool> cancel_load{false};
 
 	// Paths applied by update. Used only on the thread that calls update.
 	std::array<std::string, lts::kTrackCount> paths;
 
 	std::mutex status_mutex;
 	std::array<TrackStatus, lts::kTrackCount> status;
+
+	// Set when the user removes the source, as opposed to OBS removing all sources at exit
+	std::atomic<bool> removed_by_user{false};
 };
 
 void generator_thread(LoopTrackSource *lt)
@@ -115,12 +125,6 @@ void generator_thread(LoopTrackSource *lt)
 		frames_sent += kChunkFrames;
 		os_sleepto_ns(start_ns + util_mul_div64(frames_sent, 1000000000ULL, lts::kSampleRate));
 	}
-}
-
-void set_status(LoopTrackSource *lt, int track, TrackState state, lts::WavError error, const std::string &path)
-{
-	std::lock_guard<std::mutex> lock(lt->status_mutex);
-	lt->status[track] = {state, error, base_name(path)};
 }
 
 void loader_thread(LoopTrackSource *lt)
@@ -151,26 +155,49 @@ void loader_thread(LoopTrackSource *lt)
 			}
 		}
 
-		std::unique_ptr<lts::TrackData> previous;
-		if (path.empty()) {
-			previous = lt->engine.replace_track(track, nullptr);
-			set_status(lt, track, TRACK_EMPTY, lts::WavError::None, path);
-		} else {
-			set_status(lt, track, TRACK_LOADING, lts::WavError::None, path);
-			lts::WavLoadResult result = lts::load_wav(path);
+		std::string old_bake;
+		{
+			std::lock_guard<std::mutex> lock(lt->status_mutex);
+			old_bake = lt->status[track].bake_path;
+			lt->status[track] = {};
+			lt->status[track].state = path.empty() ? TRACK_EMPTY : TRACK_LOADING;
+			lt->status[track].name = base_name(path);
+		}
+
+		TrackStatus loaded;
+		loaded.name = base_name(path);
+		if (!path.empty()) {
+			const uint64_t start = os_gettime_ns();
+			lts::LoadResult result = lts::load_track(path, bake_folder, lt->cancel_load);
+			if (result.error == lts::LoadError::Cancelled)
+				return;
+			loaded.info = result.info;
+			loaded.bake_path = result.bake_path;
 			if (result.data) {
-				previous = lt->engine.replace_track(track, std::move(result.data));
-				set_status(lt, track, TRACK_READY, lts::WavError::None, path);
-				obs_log(LOG_INFO, "loaded track %d", track + 1);
+				loaded.state = TRACK_READY;
+				loaded.frames = result.data->frames;
+				loaded.data = result.data;
+				obs_log(LOG_INFO, "loaded track %d in %.0f ms (%u Hz, %u ch%s%s)", track + 1,
+					static_cast<double>(os_gettime_ns() - start) / 1e6, result.info.source_rate,
+					result.info.source_channels, result.info.from_bake ? ", from bake" : "",
+					result.info.trimmed ? ", trimmed" : "");
 			} else {
-				previous = lt->engine.replace_track(track, nullptr);
-				set_status(lt, track, TRACK_ERROR, result.error, path);
+				loaded.state = TRACK_ERROR;
+				loaded.error = result.error;
 				obs_log(LOG_WARNING, "failed to load track %d (error %d)", track + 1,
 					static_cast<int>(result.error));
 			}
 		}
-		// The previous data is freed here, outside the engine lock
+
+		// The previous data is released here, outside the engine lock
+		std::shared_ptr<const lts::TrackData> previous = lt->engine.replace_track(track, loaded.data);
+		{
+			std::lock_guard<std::mutex> lock(lt->status_mutex);
+			lt->status[track] = std::move(loaded);
+		}
 		previous.reset();
+		if (!old_bake.empty())
+			lts::remove_bake_if_unused(old_bake);
 	}
 }
 
@@ -196,10 +223,13 @@ void loop_track_update(void *data, obs_data_t *settings)
 	}
 	if (queued)
 		lt->job_cv.notify_one();
+}
 
-	// A loop change does not reload the files. It only validates the range against the loaded tracks.
-	lt->engine.set_loop(seconds_to_frames(obs_data_get_double(settings, kLoopStart)),
-			    seconds_to_frames(obs_data_get_double(settings, kLoopEnd)));
+void on_source_remove(void *data, calldata_t *)
+{
+	auto *lt = static_cast<LoopTrackSource *>(data);
+	if (!bulk_teardown.load())
+		lt->removed_by_user.store(true);
 }
 
 void loop_track_destroy(void *data)
@@ -207,9 +237,11 @@ void loop_track_destroy(void *data)
 	auto *lt = static_cast<LoopTrackSource *>(data);
 	if (!lt)
 		return;
+	signal_handler_disconnect(obs_source_get_signal_handler(lt->source), "remove", on_source_remove, lt);
 	lt->stop_generator.store(true);
 	if (lt->generator.joinable())
 		lt->generator.join();
+	lt->cancel_load.store(true);
 	{
 		std::lock_guard<std::mutex> lock(lt->job_mutex);
 		lt->quit_loader = true;
@@ -217,7 +249,22 @@ void loop_track_destroy(void *data)
 	lt->job_cv.notify_one();
 	if (lt->loader.joinable())
 		lt->loader.join();
+
+	// The bakes of a source the user removed are deleted unless another source uses the same file.
+	// At exit or a scene collection change, they are kept for the next load.
+	std::set<std::string> bakes;
+	if (lt->removed_by_user.load()) {
+		for (int t = 0; t < lts::kTrackCount; t++)
+			if (!lt->status[t].bake_path.empty())
+				bakes.insert(lt->status[t].bake_path);
+	}
+	for (int t = 0; t < lts::kTrackCount; t++) {
+		lt->engine.replace_track(t, nullptr);
+		lt->status[t].data.reset();
+	}
 	delete lt;
+	for (const auto &bake : bakes)
+		lts::remove_bake_if_unused(bake);
 }
 
 void proc_play(void *data, calldata_t *)
@@ -235,33 +282,80 @@ void proc_stop(void *data, calldata_t *)
 	static_cast<LoopTrackSource *>(data)->engine.stop();
 }
 
+void proc_seek(void *data, calldata_t *cd)
+{
+	const long long frames = calldata_int(cd, "frames");
+	static_cast<LoopTrackSource *>(data)->engine.seek(frames > 0 ? static_cast<uint64_t>(frames) : 0);
+}
+
 void proc_set_track(void *data, calldata_t *cd)
 {
 	auto *lt = static_cast<LoopTrackSource *>(data);
 	lt->engine.set_track_enabled(static_cast<int>(calldata_int(cd, "track")), calldata_bool(cd, "enabled"));
 }
 
+void proc_set_loop(void *data, calldata_t *cd)
+{
+	static_cast<LoopTrackSource *>(data)->engine.set_loop_enabled(calldata_bool(cd, "enabled"));
+}
+
+void proc_set_loop_range(void *data, calldata_t *cd)
+{
+	const long long start = calldata_int(cd, "start");
+	const long long end = calldata_int(cd, "end");
+	static_cast<LoopTrackSource *>(data)->engine.set_loop(start > 0 ? static_cast<uint64_t>(start) : 0,
+							      end > 0 ? static_cast<uint64_t>(end) : 0);
+}
+
+void proc_set_crossfade(void *data, calldata_t *cd)
+{
+	static_cast<LoopTrackSource *>(data)->engine.set_crossfade_enabled(calldata_bool(cd, "enabled"));
+}
+
+// Memory used by the tracks of this source. A track shared with another source is counted in both.
+long long memory_bytes(LoopTrackSource *lt)
+{
+	std::set<const lts::TrackData *> seen;
+	long long bytes = 0;
+	for (const auto &status : lt->status) {
+		if (status.data && seen.insert(status.data.get()).second)
+			bytes += static_cast<long long>(status.data->samples.size() * sizeof(int16_t));
+	}
+	return bytes;
+}
+
 void proc_get_state(void *data, calldata_t *cd)
 {
 	auto *lt = static_cast<LoopTrackSource *>(data);
-	const double rate = lts::kSampleRate;
-	calldata_set_int(cd, "transport", static_cast<int>(lt->engine.transport()));
-	calldata_set_float(cd, "position", static_cast<double>(lt->engine.position()) / rate);
-	calldata_set_float(cd, "loop_start", static_cast<double>(lt->engine.loop_start()) / rate);
-	calldata_set_float(cd, "loop_end", static_cast<double>(lt->engine.loop_end()) / rate);
-	calldata_set_int(cd, "loop_status", static_cast<int>(lt->engine.loop_status()));
+	lts::Engine &e = lt->engine;
+	calldata_set_int(cd, "transport", static_cast<int>(e.transport()));
+	calldata_set_int(cd, "position", static_cast<long long>(e.position()));
+	calldata_set_int(cd, "song_end", static_cast<long long>(e.song_end()));
+	calldata_set_int(cd, "loop_start", static_cast<long long>(e.loop_start()));
+	calldata_set_int(cd, "loop_end", static_cast<long long>(e.loop_end()));
+	calldata_set_int(cd, "requested_start", static_cast<long long>(e.requested_loop_start()));
+	calldata_set_int(cd, "requested_end", static_cast<long long>(e.requested_loop_end()));
+	calldata_set_int(cd, "loop_status", static_cast<int>(e.loop_status()));
+	calldata_set_bool(cd, "loop_enabled", e.loop_enabled());
+	calldata_set_bool(cd, "crossfade", e.crossfade_enabled());
 	long long mask = 0;
 	for (int t = 0; t < lts::kTrackCount; t++)
-		if (lt->engine.track_enabled(t))
+		if (e.track_enabled(t))
 			mask |= 1LL << t;
 	calldata_set_int(cd, "enabled_mask", mask);
 
 	std::lock_guard<std::mutex> lock(lt->status_mutex);
+	calldata_set_int(cd, "memory_bytes", memory_bytes(lt));
 	for (int t = 0; t < lts::kTrackCount; t++) {
-		const std::string index = std::to_string(t);
-		calldata_set_int(cd, ("state" + index).c_str(), lt->status[t].state);
-		calldata_set_int(cd, ("error" + index).c_str(), static_cast<int>(lt->status[t].error));
-		calldata_set_string(cd, ("name" + index).c_str(), lt->status[t].name.c_str());
+		const std::string i = std::to_string(t);
+		const TrackStatus &s = lt->status[t];
+		calldata_set_int(cd, ("state" + i).c_str(), s.state);
+		calldata_set_int(cd, ("error" + i).c_str(), static_cast<int>(s.error));
+		calldata_set_string(cd, ("name" + i).c_str(), s.name.c_str());
+		calldata_set_int(cd, ("frames" + i).c_str(), static_cast<long long>(s.frames));
+		calldata_set_int(cd, ("full_frames" + i).c_str(), static_cast<long long>(s.info.full_frames));
+		calldata_set_int(cd, ("channels" + i).c_str(), s.info.source_channels);
+		calldata_set_int(cd, ("rate" + i).c_str(), s.info.source_rate);
 	}
 }
 
@@ -271,19 +365,33 @@ void *loop_track_create(obs_data_t *settings, obs_source_t *source)
 	lt->source = source;
 	for (int t = 0; t < lts::kTrackCount; t++)
 		lt->engine.set_track_enabled(t, obs_data_get_bool(settings, track_key(t, "on").c_str()));
+	lt->engine.set_loop_enabled(obs_data_get_bool(settings, kLoopEnabled));
+	lt->engine.set_crossfade_enabled(obs_data_get_bool(settings, kCrossfade));
+	const long long start = obs_data_get_int(settings, kLoopStart);
+	const long long end = obs_data_get_int(settings, kLoopEnd);
+	lt->engine.set_loop(start > 0 ? static_cast<uint64_t>(start) : 0, end > 0 ? static_cast<uint64_t>(end) : 0);
 
 	proc_handler_t *ph = obs_source_get_proc_handler(source);
 	proc_handler_add(ph, "void play()", proc_play, lt);
 	proc_handler_add(ph, "void pause()", proc_pause, lt);
 	proc_handler_add(ph, "void stop()", proc_stop, lt);
+	proc_handler_add(ph, "void seek(int frames)", proc_seek, lt);
 	proc_handler_add(ph, "void set_track(int track, bool enabled)", proc_set_track, lt);
-	proc_handler_add(ph,
-			 "void get_state(out int transport, out float position, out float loop_start, "
-			 "out float loop_end, out int loop_status, out int enabled_mask, "
-			 "out int state0, out int state1, out int state2, out int state3, "
-			 "out int error0, out int error1, out int error2, out int error3, "
-			 "out string name0, out string name1, out string name2, out string name3)",
-			 proc_get_state, lt);
+	proc_handler_add(ph, "void set_loop(bool enabled)", proc_set_loop, lt);
+	proc_handler_add(ph, "void set_loop_range(int start, int end)", proc_set_loop_range, lt);
+	proc_handler_add(ph, "void set_crossfade(bool enabled)", proc_set_crossfade, lt);
+	std::string decl = "void get_state(out int transport, out int position, out int song_end, out int loop_start, "
+			   "out int loop_end, out int requested_start, out int requested_end, out int loop_status, "
+			   "out bool loop_enabled, out bool crossfade, out int enabled_mask, out int memory_bytes";
+	for (int t = 0; t < lts::kTrackCount; t++) {
+		const std::string i = std::to_string(t);
+		decl += ", out int state" + i + ", out int error" + i + ", out string name" + i + ", out int frames" +
+			i + ", out int full_frames" + i + ", out int channels" + i + ", out int rate" + i;
+	}
+	decl += ")";
+	proc_handler_add(ph, decl.c_str(), proc_get_state, lt);
+
+	signal_handler_connect(obs_source_get_signal_handler(source), "remove", on_source_remove, lt);
 
 	lt->loader = std::thread(loader_thread, lt);
 	loop_track_update(lt, settings);
@@ -291,22 +399,25 @@ void *loop_track_create(obs_data_t *settings, obs_source_t *source)
 	return lt;
 }
 
-// The track switches are not settings shown in the properties. The properties dialog restores all settings when
-// it is cancelled, which would undo switches made in the dock meanwhile. The engine holds them, and they are
-// written to the settings only when the scene collection is saved.
 void loop_track_save(void *data, obs_data_t *settings)
 {
 	auto *lt = static_cast<LoopTrackSource *>(data);
 	for (int t = 0; t < lts::kTrackCount; t++)
 		obs_data_set_bool(settings, track_key(t, "on").c_str(), lt->engine.track_enabled(t));
+	obs_data_set_bool(settings, kLoopEnabled, lt->engine.loop_enabled());
+	obs_data_set_bool(settings, kCrossfade, lt->engine.crossfade_enabled());
+	obs_data_set_int(settings, kLoopStart, static_cast<long long>(lt->engine.requested_loop_start()));
+	obs_data_set_int(settings, kLoopEnd, static_cast<long long>(lt->engine.requested_loop_end()));
 }
 
 void loop_track_get_defaults(obs_data_t *settings)
 {
-	obs_data_set_default_double(settings, kLoopStart, 0.0);
-	obs_data_set_default_double(settings, kLoopEnd, 0.0);
 	for (int t = 0; t < lts::kTrackCount; t++)
 		obs_data_set_default_bool(settings, track_key(t, "on").c_str(), true);
+	obs_data_set_default_bool(settings, kLoopEnabled, true);
+	obs_data_set_default_bool(settings, kCrossfade, true);
+	obs_data_set_default_int(settings, kLoopStart, 0);
+	obs_data_set_default_int(settings, kLoopEnd, 0);
 }
 
 std::string status_line(const TrackStatus &status)
@@ -317,7 +428,7 @@ std::string status_line(const TrackStatus &status)
 	case TRACK_READY:
 		return std::string(obs_module_text("Status.Ready"));
 	case TRACK_ERROR:
-		return std::string(wav_error_text(static_cast<int>(status.error)));
+		return std::string(load_error_text(static_cast<int>(status.error)));
 	default:
 		return std::string(obs_module_text("Status.Empty"));
 	}
@@ -330,37 +441,44 @@ obs_properties_t *loop_track_get_properties(void *data)
 	// Apply the settings once when OK is pressed, not on every keystroke in a path field
 	obs_properties_set_flags(props, OBS_PROPERTIES_DEFER_UPDATE);
 
+	const std::string filter = std::string(obs_module_text("AudioFiles")) + " (*.wav *.mp3 *.flac *.ogg);;" +
+				   obs_module_text("AllFiles") + " (*.*)";
 	for (int t = 0; t < lts::kTrackCount; t++) {
 		const std::string label = std::string(obs_module_text("Track")) + " " + std::to_string(t + 1);
 		obs_properties_add_path(props, track_key(t, "path").c_str(), label.c_str(), OBS_PATH_FILE,
-					"WAV (*.wav)", nullptr);
+					filter.c_str(), nullptr);
 	}
-
-	obs_property_t *start =
-		obs_properties_add_float(props, kLoopStart, obs_module_text("LoopStart"), 0.0, 86400.0, 0.001);
-	obs_property_float_set_suffix(start, " s");
-	obs_property_t *end =
-		obs_properties_add_float(props, kLoopEnd, obs_module_text("LoopEnd"), 0.0, 86400.0, 0.001);
-	obs_property_float_set_suffix(end, " s");
-	obs_property_set_long_description(end, obs_module_text("LoopEnd.Description"));
 
 	if (lt) {
 		std::string text;
+		long long bytes = 0;
 		{
 			std::lock_guard<std::mutex> lock(lt->status_mutex);
 			for (int t = 0; t < lts::kTrackCount; t++) {
 				text += std::string(obs_module_text("Track")) + " " + std::to_string(t + 1) + ": " +
 					status_line(lt->status[t]) + "\n";
 			}
+			bytes = memory_bytes(lt);
 		}
-		text += std::string(obs_module_text("Loop")) + ": " +
-			loop_status_text(static_cast<int>(lt->engine.loop_status()));
+		char memory[64];
+		snprintf(memory, sizeof(memory), "%.0f MB", static_cast<double>(bytes) / (1024.0 * 1024.0));
+		text += std::string(obs_module_text("Memory")) + ": " + memory;
 		obs_properties_add_text(props, "status", text.c_str(), OBS_TEXT_INFO);
 	}
 	return props;
 }
 
 } // namespace
+
+void set_bake_dir(const std::string &dir)
+{
+	bake_folder = dir;
+}
+
+const std::string &bake_dir()
+{
+	return bake_folder;
+}
 
 const char *transport_text(int transport)
 {
@@ -378,30 +496,26 @@ const char *loop_status_text(int status)
 {
 	switch (static_cast<lts::LoopStatus>(status)) {
 	case lts::LoopStatus::Ok:
-		return obs_module_text("Loop.Ok");
+		return "";
 	case lts::LoopStatus::StartNotBeforeEnd:
 		return obs_module_text("Loop.StartNotBeforeEnd");
-	case lts::LoopStatus::EndBeyondTrack:
-		return obs_module_text("Loop.EndBeyondTrack");
+	case lts::LoopStatus::EndBeyondSong:
+		return obs_module_text("Loop.EndBeyondSong");
 	default:
 		return obs_module_text("Loop.NoTracks");
 	}
 }
 
-const char *wav_error_text(int error)
+const char *load_error_text(int error)
 {
-	switch (static_cast<lts::WavError>(error)) {
-	case lts::WavError::OpenFailed:
+	switch (static_cast<lts::LoadError>(error)) {
+	case lts::LoadError::OpenFailed:
 		return obs_module_text("Error.OpenFailed");
-	case lts::WavError::NotStereo:
-		return obs_module_text("Error.NotStereo");
-	case lts::WavError::Not48k:
-		return obs_module_text("Error.Not48k");
-	case lts::WavError::UnsupportedFormat:
+	case lts::LoadError::UnsupportedFormat:
 		return obs_module_text("Error.UnsupportedFormat");
-	case lts::WavError::ReadFailed:
+	case lts::LoadError::ReadFailed:
 		return obs_module_text("Error.ReadFailed");
-	case lts::WavError::OutOfMemory:
+	case lts::LoadError::OutOfMemory:
 		return obs_module_text("Error.OutOfMemory");
 	default:
 		return "";
