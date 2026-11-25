@@ -34,6 +34,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QPainter>
 #include <QPushButton>
 #include <QSlider>
+#include <QStyle>
 #include <QTimer>
 #include <QToolButton>
 #include <QToolTip>
@@ -64,7 +65,9 @@ QString time_text(uint64_t frames)
 
 QLabel *make_warning(QWidget *parent, const QString &name)
 {
-	auto *label = new QLabel("[!]", parent);
+	// The standard warning icon of the style follows the platform and needs no bundled image or emoji font
+	auto *label = new QLabel(parent);
+	label->setPixmap(parent->style()->standardIcon(QStyle::SP_MessageBoxWarning).pixmap(16, 16));
 	label->setObjectName(name);
 	label->setVisible(false);
 	return label;

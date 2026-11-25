@@ -480,6 +480,21 @@ void test_loader(const fs::path &fixtures)
 	}
 	check(lts::remove_bake_if_unused(bake_path), "an unused bake is removed");
 
+	// A bake that cannot be put in place does not stop loading: a folder blocks the bake's name
+	{
+		std::string blocked;
+		{
+			const lts::LoadResult r = load(mp3, bakes);
+			blocked = r.bake_path;
+		}
+		fs::remove(fs::u8path(blocked));
+		fs::create_directory(fs::u8path(blocked));
+		const lts::LoadResult r = load(mp3, bakes);
+		check(r.data && r.data->frames == 48000 && !r.detail.empty(),
+		      "a track loads when its bake cannot be written (" + r.detail + ")");
+		fs::remove(fs::u8path(blocked));
+	}
+
 	// Errors
 	check(load(dir / "missing.wav").error == lts::LoadError::OpenFailed, "a missing file is reported");
 	{

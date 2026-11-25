@@ -98,6 +98,9 @@ void run_next()
 	QTimer::singleShot(delay, main_window(), run_next);
 }
 
+// The second scene of scenario S6, created and released by the probe
+obs_scene_t *scene2 = nullptr;
+
 QString song(const QString &relative)
 {
 	return QDir(songs).filePath(relative);
@@ -432,7 +435,14 @@ void setup_steps()
 		check(st.ready == 4, "S1: four MP3 stems are loaded");
 		check(st.frames[0] == 768000 && st.frames[3] == 768000,
 		      QString("S1: MP3 stems are exactly 16 s after removing the encoder delay (%1)").arg(st.frames[0]));
+		return 400;
+	});
+	steps.push_back([] {
+		// The dock learns about new sources through queued signals, so it is used one step after the creation
 		check(select_in_dock("S1 DAW"), "S1: the dock selects the source");
+		return 200;
+	});
+	steps.push_back([] {
 		enter_value("loop_start_spin", 4.0);
 		enter_value("loop_end_spin", 12.0);
 		return 300;
@@ -492,7 +502,13 @@ void setup_steps()
 		for (int t = 0; t < 4; t++)
 			same = same && st.frames[t] == 768000;
 		check(same, "S2: every format becomes 16 s at 48 kHz");
+		return 400;
+	});
+	steps.push_back([] {
 		check(select_in_dock("S2 mixed"), "S2: the dock selects the source");
+		return 300;
+	});
+	steps.push_back([] {
 		check(visible_warnings().isEmpty(),
 		      "S2: mixed formats of equal length show no [!] (" + visible_warnings().join("; ") + ")");
 		enter_value("loop_start_spin", 4.0);
@@ -515,6 +531,9 @@ void setup_steps()
 		obs_source_t *s = create_in_scene("Misaligned", stems("misaligned"));
 		obs_source_release(s);
 		wait_loaded("Misaligned", 4, 30000);
+		return 400;
+	});
+	steps.push_back([] {
 		check(select_in_dock("Misaligned"), "misaligned: the dock selects the source");
 		return 300;
 	});
@@ -526,6 +545,9 @@ void setup_steps()
 		      "misaligned: [!] appears next to the tracks shorter than the song");
 		auto *label = dock_child<QLabel>("track_warning_3");
 		evidence.insert("misaligned_tooltip", label ? label->toolTip() : QString());
+		// A picture of the dock with warnings, for the author to look at
+		if (auto *d = dock())
+			d->grab().save(result_dir + "/dock-misaligned.png");
 		check(label && label->toolTip().contains("0:14.0") && label->toolTip().contains("0:18.0"),
 		      "misaligned: the tooltip gives the track end and the song end");
 		click("play_button");
@@ -551,7 +573,10 @@ void setup_steps()
 		const State st = get_state("S3 long");
 		check(st.frames[0] == 28800000, "S3: the 30-minute file is cut at 10 minutes");
 		check(st.full_frames[0] > 86000000, "S3: the original length is kept for the warning");
-		select_in_dock("S3 long");
+		return 400;
+	});
+	steps.push_back([] {
+		check(select_in_dock("S3 long"), "S3: the dock selects the source");
 		return 300;
 	});
 	steps.push_back([] {
@@ -600,26 +625,38 @@ void setup_steps()
 		return 200;
 	});
 	steps.push_back([] {
-		// S6: the same files in another source share the memory
-		obs_source_t *scene = obs_scene_get_source(obs_scene_create("Scene 2"));
+		// S6: the same files in another source, in another scene, share the memory
+		scene2 = obs_scene_create("Scene 2");
 		QStringList paths;
 		for (int i = 1; i <= 4; i++)
 			paths << work(QString("long/set-%1.mp3").arg(i));
 		const double before = resident_mb();
-		obs_source_t *s = create_in_scene("Memory shared", paths, scene);
+		obs_source_t *s = create_in_scene("Memory shared", paths, obs_scene_get_source(scene2));
 		obs_source_release(s);
 		wait_loaded("Memory shared", 4, 60000);
 		evidence.insert("shared_increase_mb", resident_mb() - before);
 		check(resident_mb() - before < 40.0, "S6: a second source with the same files shares the memory");
+		return 400;
+	});
+	steps.push_back([] {
 		check(select_in_dock("Memory shared") && select_in_dock("Memory max"),
 		      "S6: the dock switches between the two sources");
-		const double before_remove = resident_mb();
+		evidence.insert("resident_mb_before_remove", resident_mb());
 		remove_source("Memory shared");
 		remove_source("Memory max");
-		os_sleep_ms(1500);
-		evidence.insert("memory_released_mb", before_remove - resident_mb());
-		check(before_remove - resident_mb() > 300.0, "memory: removing the sources releases the tracks");
-		return 300;
+		// The probe's own scene is removed and released, so that it holds no source at exit
+		obs_source_remove(obs_scene_get_source(scene2));
+		obs_scene_release(scene2);
+		scene2 = nullptr;
+		// Measured after the event loop has run, because OBS releases some references from queued UI events
+		return 4000;
+	});
+	steps.push_back([] {
+		const double released = evidence.value("resident_mb_before_remove").toDouble() - resident_mb();
+		evidence.insert("memory_released_mb", released);
+		check(released > 300.0,
+		      QString("memory: removing the sources releases the tracks (%1 MB)").arg(released));
+		return 200;
 	});
 
 	// Broken files, 5.1, and a loop end beyond the song
@@ -629,7 +666,10 @@ void setup_steps()
 						   song("chaos/x-pad-5.1.flac"), song("aligned/4-lead.wav")});
 		obs_source_release(s);
 		wait_loaded("Broken", 4, 30000);
-		select_in_dock("Broken");
+		return 400;
+	});
+	steps.push_back([] {
+		check(select_in_dock("Broken"), "broken: the dock selects the source");
 		return 300;
 	});
 	steps.push_back([] {
@@ -776,12 +816,68 @@ void restore_steps()
 	});
 }
 
+// --- CPU phase: compares the CPU use of OBS with no source, five media sources, and five loop track sources ---
+
+void cpu_steps()
+{
+	auto measure = [](const char *key) {
+		QJsonArray values;
+		for (int i = 0; i < 3; i++)
+			values.append(cpu_percent(5000));
+		evidence.insert(key, values);
+	};
+	steps.push_back([measure] {
+		measure("cpu_no_source");
+		for (int i = 1; i <= 5; i++) {
+			obs_data_t *settings = obs_data_create();
+			obs_data_set_string(settings, "local_file", song("aligned/1-pad.wav").toUtf8().constData());
+			obs_data_set_bool(settings, "looping", true);
+			obs_source_t *media = obs_source_create(
+				"ffmpeg_source", QString("Media %1").arg(i).toUtf8().constData(), settings, nullptr);
+			obs_data_release(settings);
+			obs_source_t *scene_source = obs_frontend_get_current_scene();
+			obs_scene_add(obs_scene_from_source(scene_source), media);
+			obs_source_release(scene_source);
+			obs_source_release(media);
+		}
+		return 2000;
+	});
+	steps.push_back([measure] {
+		measure("cpu_five_media_sources_playing");
+		for (int i = 1; i <= 5; i++)
+			remove_source(QString("Media %1").arg(i).toUtf8().constData());
+		for (int i = 1; i <= 5; i++) {
+			obs_source_t *s =
+				create_in_scene(QString("Loop %1").arg(i).toUtf8().constData(), stems("aligned"));
+			obs_source_release(s);
+		}
+		return 3000;
+	});
+	steps.push_back([measure] {
+		measure("cpu_five_loop_sources_stopped");
+		for (int i = 1; i <= 5; i++) {
+			obs_source_t *source = obs_get_source_by_name(QString("Loop %1").arg(i).toUtf8().constData());
+			calldata_t cd = {};
+			proc_handler_call(obs_source_get_proc_handler(source), "play", &cd);
+			calldata_free(&cd);
+			obs_source_release(source);
+		}
+		return 1000;
+	});
+	steps.push_back([measure] {
+		measure("cpu_five_loop_sources_playing");
+		return 0;
+	});
+}
+
 void on_frontend_event(enum obs_frontend_event event, void *)
 {
 	if (event != OBS_FRONTEND_EVENT_FINISHED_LOADING)
 		return;
 	if (phase == "setup")
 		setup_steps();
+	else if (phase == "cpu")
+		cpu_steps();
 	else
 		restore_steps();
 	// Let the plugin add its dock first, which it also does on FINISHED_LOADING

@@ -35,6 +35,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <mutex>
 #include <new>
 #include <system_error>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -419,7 +420,9 @@ public:
 	uint64_t frames() const { return frames_; }
 	std::vector<int16_t> take_memory() { return std::move(memory_); }
 	// Writes the final header and renames the temporary file. Returns false when the file could not be finished.
-	bool finish(const fs::path &bake, uint64_t full_frames)
+	// Writes the final header and renames the temporary file to the bake. Returns false when the bake could not be
+	// finished. When only the rename failed, the complete temporary file is kept for the caller to read.
+	bool finish(const fs::path &bake, uint64_t full_frames, std::string &detail)
 	{
 		if (!file_)
 			return false;
@@ -429,14 +432,24 @@ public:
 		ok = std::fclose(file_) == 0 && ok;
 		file_ = nullptr;
 		std::error_code ec;
-		if (ok) {
-			fs::rename(temp_, bake, ec);
-			ok = !ec;
-		}
-		if (!ok)
+		if (!ok) {
+			detail = "writing the bake header failed";
 			fs::remove(temp_, ec);
-		return ok;
+			return false;
+		}
+		// Another program, such as a virus scanner, may hold the new file open for a moment. The rename is retried.
+		for (int attempt = 0; attempt < 20; attempt++) {
+			fs::rename(temp_, bake, ec);
+			if (!ec)
+				return true;
+			std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		}
+		detail = "renaming the bake failed: " + ec.message();
+		temp_kept_ = true;
+		return false;
 	}
+	bool temp_kept() const { return temp_kept_; }
+	const fs::path &temp() const { return temp_; }
 
 private:
 	void fail()
@@ -455,6 +468,7 @@ private:
 	FILE *file_ = nullptr;
 	std::vector<int16_t> memory_;
 	uint64_t frames_ = 0;
+	bool temp_kept_ = false;
 
 public:
 	// True when samples were lost because writing failed after some were written
@@ -622,19 +636,34 @@ LoadResult convert(Decoder &decoder, const std::string &path, const SourceStat &
 		result.info.trimmed = full > sink.frames();
 
 		if (sink.to_file()) {
-			if (sink.finish(bake, full)) {
-				LoadResult baked;
+			LoadResult baked;
+			if (sink.finish(bake, full, result.detail)) {
 				if (read_bake(bake, path, stat, baked)) {
 					baked.info.from_bake = false;
 					baked.bake_path = bake.u8string();
 					return baked;
 				}
+				result.detail = "reading back the bake failed";
+			} else if (sink.temp_kept()) {
+				// The bake could not be put in place. The samples are read from the temporary file, which is
+				// deleted afterwards, so playback goes on without a bake.
+				const bool read = read_bake(sink.temp(), path, stat, baked);
+				std::error_code ec;
+				fs::remove(sink.temp(), ec);
+				if (read) {
+					baked.info.from_bake = false;
+					baked.detail = result.detail;
+					return baked;
+				}
 			}
 			result.error = LoadError::ReadFailed;
+			result.retry_without_bake = true;
 			return result;
 		}
 		if (sink.lost_) {
+			result.detail = "writing the bake failed after some samples";
 			result.error = LoadError::ReadFailed;
+			result.retry_without_bake = true;
 			return result;
 		}
 		auto data = std::make_shared<TrackData>();
@@ -705,6 +734,15 @@ LoadResult load_track(const std::string &path, const std::string &bake_dir, cons
 		}
 		if (!result.data)
 			result = convert(*decoder, path, stat, bake, cancel);
+		if (result.retry_without_bake) {
+			// The bake failed. The file is decoded again into memory only, so that it still plays.
+			const std::string detail = result.detail;
+			std::unique_ptr<Decoder> again = open_decoder(source, format);
+			if (again) {
+				result = convert(*again, path, stat, fs::path(), cancel);
+				result.detail = detail + "; loaded without a bake";
+			}
+		}
 	}
 
 	if (result.data) {

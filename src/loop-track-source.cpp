@@ -40,7 +40,7 @@ std::atomic<bool> bulk_teardown{false};
 
 namespace {
 
-// Each chunk is 10 ms. The chunk for [t, t + 10 ms) is sent at time t, the same way as simple-white-noise.
+// Each chunk is 10 ms. The chunk for [t, t + 10 ms) is sent at about t - 10 ms.
 constexpr size_t kChunkFrames = 480;
 
 // Settings keys. The track paths are shown in the properties. The others are written by save and read by create,
@@ -123,7 +123,11 @@ void generator_thread(LoopTrackSource *lt)
 		obs_source_output_audio(lt->source, &audio);
 
 		frames_sent += kChunkFrames;
-		os_sleepto_ns(start_ns + util_mul_div64(frames_sent, 1000000000ULL, lts::kSampleRate));
+		// Stays one chunk ahead of the wall clock. os_sleepto_ns_fast only sleeps, so it may wake up a little late,
+		// and the extra chunk covers that. os_sleepto_ns would spin for the last millisecond of every chunk on
+		// Windows, which cost about 14% of a CPU core per source.
+		os_sleepto_ns_fast(start_ns +
+				   util_mul_div64(frames_sent - kChunkFrames, 1000000000ULL, lts::kSampleRate));
 	}
 }
 
@@ -187,6 +191,8 @@ void loader_thread(LoopTrackSource *lt)
 				obs_log(LOG_WARNING, "failed to load track %d (error %d)", track + 1,
 					static_cast<int>(result.error));
 			}
+			if (!result.detail.empty())
+				obs_log(LOG_WARNING, "track %d: %s", track + 1, result.detail.c_str());
 		}
 
 		// The previous data is released here, outside the engine lock
