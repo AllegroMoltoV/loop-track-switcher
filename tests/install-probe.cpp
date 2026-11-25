@@ -98,6 +98,9 @@ void run_next()
 	QTimer::singleShot(delay, main_window(), run_next);
 }
 
+// The second scene of scenario S6, created and released by the probe
+obs_scene_t *scene2 = nullptr;
+
 QString song(const QString &relative)
 {
 	return QDir(songs).filePath(relative);
@@ -432,7 +435,14 @@ void setup_steps()
 		check(st.ready == 4, "S1: four MP3 stems are loaded");
 		check(st.frames[0] == 768000 && st.frames[3] == 768000,
 		      QString("S1: MP3 stems are exactly 16 s after removing the encoder delay (%1)").arg(st.frames[0]));
+		return 400;
+	});
+	steps.push_back([] {
+		// The dock learns about new sources through queued signals, so it is used one step after the creation
 		check(select_in_dock("S1 DAW"), "S1: the dock selects the source");
+		return 200;
+	});
+	steps.push_back([] {
 		enter_value("loop_start_spin", 4.0);
 		enter_value("loop_end_spin", 12.0);
 		return 300;
@@ -492,7 +502,13 @@ void setup_steps()
 		for (int t = 0; t < 4; t++)
 			same = same && st.frames[t] == 768000;
 		check(same, "S2: every format becomes 16 s at 48 kHz");
+		return 400;
+	});
+	steps.push_back([] {
 		check(select_in_dock("S2 mixed"), "S2: the dock selects the source");
+		return 300;
+	});
+	steps.push_back([] {
 		check(visible_warnings().isEmpty(),
 		      "S2: mixed formats of equal length show no [!] (" + visible_warnings().join("; ") + ")");
 		enter_value("loop_start_spin", 4.0);
@@ -515,6 +531,9 @@ void setup_steps()
 		obs_source_t *s = create_in_scene("Misaligned", stems("misaligned"));
 		obs_source_release(s);
 		wait_loaded("Misaligned", 4, 30000);
+		return 400;
+	});
+	steps.push_back([] {
 		check(select_in_dock("Misaligned"), "misaligned: the dock selects the source");
 		return 300;
 	});
@@ -551,7 +570,10 @@ void setup_steps()
 		const State st = get_state("S3 long");
 		check(st.frames[0] == 28800000, "S3: the 30-minute file is cut at 10 minutes");
 		check(st.full_frames[0] > 86000000, "S3: the original length is kept for the warning");
-		select_in_dock("S3 long");
+		return 400;
+	});
+	steps.push_back([] {
+		check(select_in_dock("S3 long"), "S3: the dock selects the source");
 		return 300;
 	});
 	steps.push_back([] {
@@ -600,26 +622,38 @@ void setup_steps()
 		return 200;
 	});
 	steps.push_back([] {
-		// S6: the same files in another source share the memory
-		obs_source_t *scene = obs_scene_get_source(obs_scene_create("Scene 2"));
+		// S6: the same files in another source, in another scene, share the memory
+		scene2 = obs_scene_create("Scene 2");
 		QStringList paths;
 		for (int i = 1; i <= 4; i++)
 			paths << work(QString("long/set-%1.mp3").arg(i));
 		const double before = resident_mb();
-		obs_source_t *s = create_in_scene("Memory shared", paths, scene);
+		obs_source_t *s = create_in_scene("Memory shared", paths, obs_scene_get_source(scene2));
 		obs_source_release(s);
 		wait_loaded("Memory shared", 4, 60000);
 		evidence.insert("shared_increase_mb", resident_mb() - before);
 		check(resident_mb() - before < 40.0, "S6: a second source with the same files shares the memory");
+		return 400;
+	});
+	steps.push_back([] {
 		check(select_in_dock("Memory shared") && select_in_dock("Memory max"),
 		      "S6: the dock switches between the two sources");
-		const double before_remove = resident_mb();
+		evidence.insert("resident_mb_before_remove", resident_mb());
 		remove_source("Memory shared");
 		remove_source("Memory max");
-		os_sleep_ms(1500);
-		evidence.insert("memory_released_mb", before_remove - resident_mb());
-		check(before_remove - resident_mb() > 300.0, "memory: removing the sources releases the tracks");
-		return 300;
+		// The probe's own scene is removed and released, so that it holds no source at exit
+		obs_source_remove(obs_scene_get_source(scene2));
+		obs_scene_release(scene2);
+		scene2 = nullptr;
+		// Measured after the event loop has run, because OBS releases some references from queued UI events
+		return 4000;
+	});
+	steps.push_back([] {
+		const double released = evidence.value("resident_mb_before_remove").toDouble() - resident_mb();
+		evidence.insert("memory_released_mb", released);
+		check(released > 300.0,
+		      QString("memory: removing the sources releases the tracks (%1 MB)").arg(released));
+		return 200;
 	});
 
 	// Broken files, 5.1, and a loop end beyond the song
@@ -629,7 +663,10 @@ void setup_steps()
 						   song("chaos/x-pad-5.1.flac"), song("aligned/4-lead.wav")});
 		obs_source_release(s);
 		wait_loaded("Broken", 4, 30000);
-		select_in_dock("Broken");
+		return 400;
+	});
+	steps.push_back([] {
+		check(select_in_dock("Broken"), "broken: the dock selects the source");
 		return 300;
 	});
 	steps.push_back([] {
